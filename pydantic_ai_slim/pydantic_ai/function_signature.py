@@ -387,18 +387,25 @@ class FunctionSignature:
 
         for sig in signatures:
             deduped: list[TypeSignature] = []
+            replacements: dict[int, TypeSignature] = {}
             for type_sig in sig.referenced_types:
                 name = type_sig.name
-                if name not in seen:
+                canonical = seen.get(name)
+                if canonical is None:
                     seen[name] = type_sig
                     deduped.append(type_sig)
-                elif seen[name].structurally_equal(type_sig):
-                    canonical = seen[name]
-                    _replace_type_refs(sig, type_sig, canonical)
+                elif canonical is type_sig:
+                    # Already unified: a signature deduplicated by an earlier call, or one that
+                    # shares the instance with another signature. Nothing to compare or rewrite.
+                    deduped.append(type_sig)
+                elif canonical.structurally_equal(type_sig):
+                    replacements[id(type_sig)] = canonical
                     deduped.append(canonical)
                 else:
                     prefixed.add(name)
                     deduped.append(type_sig)
+            if replacements:
+                _replace_type_refs(sig, replacements)
             sig.referenced_types = deduped
 
         return frozenset(prefixed)
@@ -839,11 +846,16 @@ def _build_type_signature(
 # =============================================================================
 
 
-def _replace_type_refs(sig: FunctionSignature, old_ref: TypeSignature, canonical: TypeSignature) -> None:
-    """Replace all references to old_ref with canonical in a signature's TypeExpr trees."""
+def _replace_type_refs(sig: FunctionSignature, replacements: dict[int, TypeSignature]) -> None:
+    """Swap the types keyed by `id()` in `replacements` for their canonical instances.
+
+    One pass over the signature's params, return type and referenced types' fields, whatever the
+    number of types being unified.
+    """
 
     def _replace_in_expr(expr: TypeExpr) -> TypeExpr:
-        if expr is old_ref:
+        canonical = replacements.get(id(expr))
+        if canonical is not None:
             return canonical
         if isinstance(expr, GenericTypeExpr):
             new_args = [_replace_in_expr(a) for a in expr.args]
