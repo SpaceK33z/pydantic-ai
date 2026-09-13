@@ -4,12 +4,15 @@ from __future__ import annotations
 
 import ast
 import typing
+from dataclasses import asdict, fields, replace
 from enum import Enum
 from typing import Optional, Union
+from unittest.mock import patch
 
+import pydantic_core
 import pytest
 import typing_extensions
-from pydantic import BaseModel, RootModel
+from pydantic import BaseModel, RootModel, TypeAdapter
 
 from pydantic_ai._run_context import RunContext
 from pydantic_ai.function_signature import (
@@ -37,6 +40,14 @@ class _Color(str, Enum):
 class _ConfigWithEnum(BaseModel):
     name: str
     color: _Color
+
+
+class _UserA(BaseModel):
+    name: str
+
+
+class _UserADifferent(BaseModel):
+    id: int
 
 
 class _SearchParams(typing_extensions.TypedDict):
@@ -1710,3 +1721,247 @@ def test_boolean_additional_properties_render_as_dict_any():
             },
         )
         assert str(sig.params['meta'].type) == 'dict[str, Any]'
+
+
+# =============================================================================
+# Signature caching across definitions
+# =============================================================================
+
+
+def _render_catalog(tool_defs: list[ToolDefinition]) -> str:
+    """Render tool definitions the way code mode does: shared TypedDicts, then signatures."""
+    sigs = [td.function_signature for td in tool_defs]
+    conflicting = FunctionSignature.get_conflicting_type_names(sigs)
+    blocks = FunctionSignature.render_type_definitions(sigs, conflicting)
+    blocks.extend(td.render_signature('...', conflicting_type_names=conflicting) for td in tool_defs)
+    return '\n\n'.join(blocks)
+
+
+def test_function_signature_is_reused_across_tool_def_reads_and_replace():
+    """One signature per tool, not one per model request step.
+
+    `Tool.tool_def` creates a fresh definition on every read and toolsets `replace()` definitions
+    every step, so a signature cached on the definition alone would be rebuilt every step.
+    """
+
+    def my_tool(user: _UserInfo, limit: int = 10) -> _UserInfo:
+        """A test tool."""
+        return user  # pragma: no cover
+
+    tool = Tool(my_tool)
+    sig = tool.tool_def.function_signature
+
+    assert tool.tool_def.function_signature is sig
+    assert replace(tool.tool_def, toolset_id='ts', description='changed').function_signature is sig
+
+    # A direct `ToolDefinition` caches from its first access onwards, through `replace()` too.
+    td = ToolDefinition(name='direct', parameters_json_schema=tool.tool_def.parameters_json_schema)
+    direct_sig = td.function_signature
+    assert td.function_signature is direct_sig
+    assert replace(td, strict=True).function_signature is direct_sig
+
+
+def test_function_signature_cache_follows_name_and_schema_objects():
+    """A renamed or re-schemaed definition never renders a signature that is not its own."""
+
+    def my_tool(user: _UserInfo, limit: int = 10) -> _UserInfo:
+        """A test tool."""
+        return user  # pragma: no cover
+
+    tool = Tool(my_tool)
+    td = tool.tool_def
+    sig = td.function_signature
+
+    # The name seeds fallback type names and the dedup prefix, so it keys its own entry --
+    # without evicting the original, which the tool keeps handing out.
+    renamed = replace(td, name='prefixed_my_tool')
+    renamed_sig = renamed.function_signature
+    assert renamed_sig is not sig
+    assert renamed_sig.name == 'prefixed_my_tool'
+    assert tool.tool_def.function_signature is sig
+    assert replace(td, name='prefixed_my_tool').function_signature is renamed_sig
+
+    # New schema objects, as a model transformer or `replace(return_schema=None)` produces.
+    no_return = replace(td, return_schema=None)
+    assert no_return.function_signature is not sig
+    assert no_return.render_signature('...') == snapshot("""\
+def my_tool(*, user: _UserInfo, limit: int = 10) -> Any:
+    \"\"\"A test tool.\"\"\"
+    ...\
+""")
+    assert td.render_signature('...') == snapshot("""\
+def my_tool(*, user: _UserInfo, limit: int = 10) -> _UserInfo:
+    \"\"\"A test tool.\"\"\"
+    ...\
+""")
+
+
+def test_function_signature_cache_is_invisible_to_serialization_and_equality():
+    """The cache must never reach a serialized definition again (#5083), on any path."""
+
+    def my_tool(x: int) -> str:
+        """A test tool."""
+        return ''  # pragma: no cover
+
+    td = Tool(my_tool).tool_def
+    assert td.function_signature is td.function_signature
+    assert '_function_signatures' not in repr(td)
+    assert '_function_signatures' not in {f.name for f in fields(td)}
+    assert '_function_signatures' not in asdict(td)
+    assert b'_function_signatures' not in pydantic_core.to_json(td)
+
+    dumped = TypeAdapter(ToolDefinition).dump_python(td, mode='json')
+    assert '_function_signatures' not in dumped
+    restored = TypeAdapter(ToolDefinition).validate_python(dumped)
+    assert restored == td
+    assert restored.function_signature.render('...') == td.function_signature.render('...')
+
+
+def test_get_conflicting_type_names_short_circuits_unified_types():
+    """A type already unified to the canonical instance is neither compared nor rewritten."""
+    user = TypeSignature(
+        name='User',
+        fields={'name': TypeFieldSignature(name='name', type=SimpleTypeExpr('str'), required=True)},
+    )
+    sig1 = FunctionSignature(
+        name='tool_a',
+        params={'user': FunctionParam(name='user', type=user)},
+        return_type=user,
+        referenced_types=[user],
+    )
+    # Shares the instance with sig1 outright, as a second render after deduplication does.
+    sig2 = FunctionSignature(
+        name='tool_b',
+        params={'user': FunctionParam(name='user', type=GenericTypeExpr(base='list', args=[user]))},
+        return_type=SimpleTypeExpr('Any'),
+        referenced_types=[user],
+    )
+    calls: list[str] = []
+    original = TypeSignature.structurally_equal
+
+    def counting(self: TypeSignature, other: TypeSignature) -> bool:
+        calls.append(self.name)
+        return original(self, other)
+
+    with patch.object(TypeSignature, 'structurally_equal', counting):
+        assert FunctionSignature.get_conflicting_type_names([sig1, sig2]) == frozenset()
+    assert calls == []
+    assert sig2.referenced_types == [user]
+    assert sig2.params['user'].type == GenericTypeExpr(base='list', args=[user])
+
+
+def test_get_conflicting_type_names_rewrites_all_duplicates_in_one_pass():
+    """Every duplicate in a signature is unified, and generic/union nodes are rewritten in place."""
+
+    def make(name: str) -> tuple[TypeSignature, TypeSignature]:
+        address = TypeSignature(
+            name='Address',
+            fields={'city': TypeFieldSignature(name='city', type=SimpleTypeExpr('str'), required=True)},
+        )
+        user = TypeSignature(
+            name='User',
+            fields={'address': TypeFieldSignature(name='address', type=address, required=True)},
+        )
+        return user, address
+
+    user1, address1 = make('a')
+    user2, address2 = make('b')
+    sig1 = FunctionSignature(
+        name='tool_a',
+        params={'user': FunctionParam(name='user', type=user1)},
+        return_type=address1,
+        referenced_types=[user1, address1],
+    )
+    sig2 = FunctionSignature(
+        name='tool_b',
+        params={
+            'users': FunctionParam(name='users', type=GenericTypeExpr(base='list', args=[user2])),
+            'address': FunctionParam(name='address', type=UnionTypeExpr(members=[address2, SimpleTypeExpr('None')])),
+        },
+        return_type=user2,
+        referenced_types=[user2, address2],
+    )
+
+    assert FunctionSignature.get_conflicting_type_names([sig1, sig2]) == frozenset()
+
+    assert sig2.referenced_types == [user1, address1]
+    assert all(t is not user2 and t is not address2 for t in sig2.referenced_types)
+    users = sig2.params['users'].type
+    assert isinstance(users, GenericTypeExpr) and users.args[0] is user1
+    address = sig2.params['address'].type
+    assert isinstance(address, UnionTypeExpr) and address.members[0] is address1
+    assert sig2.return_type is user1
+    # The nested field reference inside sig2's own copy of `User` was rewritten as well.
+    assert user2.fields['address'].type is address1
+
+
+def test_shared_signatures_render_stably_across_alternating_catalogs():
+    """Signatures now outlive one render, and `get_conflicting_type_names` mutates them in place.
+
+    Two catalogs that disagree on which `User` is canonical, and one where `User` conflicts, are
+    rendered in alternation; every render must equal its own first render and prefix correctly.
+    """
+
+    def tool_a(user: _UserA, verbose: bool = False) -> _UserA:
+        """Tool A."""
+        return user  # pragma: no cover
+
+    def tool_b(user: _UserA, users: list[_UserA] | None = None) -> _UserA:
+        """Tool B."""
+        return user  # pragma: no cover
+
+    def tool_c(user: _UserADifferent, verbose: bool = False) -> _UserADifferent:
+        """Tool C."""
+        return user  # pragma: no cover
+
+    # Same TypedDict name as the other two, different structure.
+    schema = Tool(tool_c).tool_def.parameters_json_schema
+    tool_c_def = replace(
+        Tool(tool_c).tool_def,
+        parameters_json_schema={
+            **schema,
+            '$defs': {'_UserA': schema['$defs']['_UserADifferent']},
+            'properties': {**schema['properties'], 'user': {'$ref': '#/$defs/_UserA'}},
+        },
+        return_schema=None,
+    )
+    a, b = Tool(tool_a), Tool(tool_b)
+
+    catalogs = {
+        'ab': lambda: [a.tool_def, b.tool_def],
+        'ba': lambda: [b.tool_def, a.tool_def],
+        'bc': lambda: [b.tool_def, tool_c_def],
+        'ca': lambda: [tool_c_def, a.tool_def],
+    }
+    first = {name: _render_catalog(build()) for name, build in catalogs.items()}
+    for _ in range(2):
+        for name, build in catalogs.items():
+            assert _render_catalog(build()) == first[name], name
+
+    assert first['ab'] == snapshot("""\
+class _UserA(TypedDict):
+    name: str
+
+def tool_a(*, user: _UserA, verbose: bool = False) -> _UserA:
+    \"\"\"Tool A.\"\"\"
+    ...
+
+def tool_b(*, user: _UserA, users: list[_UserA] | None = None) -> _UserA:
+    \"\"\"Tool B.\"\"\"
+    ...\
+""")
+    assert first['bc'] == snapshot("""\
+class tool_b__UserA(TypedDict):
+    name: str
+
+class tool_c__UserA(TypedDict):
+    id: int
+
+def tool_b(*, user: tool_b__UserA, users: list[tool_b__UserA] | None = None) -> tool_b__UserA:
+    \"\"\"Tool B.\"\"\"
+    ...
+
+def tool_c(*, user: tool_c__UserA, verbose: bool = False) -> Any:
+    \"\"\"Tool C.\"\"\"
+    ...\
+""")

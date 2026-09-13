@@ -2,8 +2,7 @@ from __future__ import annotations as _annotations
 
 import inspect
 from collections.abc import Awaitable, Callable, Sequence
-from dataclasses import dataclass, field
-from functools import cached_property
+from dataclasses import InitVar, dataclass, field
 from typing import Annotated, Any, Concatenate, Generic, Literal, TypeAlias, Union, cast
 
 from pydantic import AliasChoices, Field
@@ -320,6 +319,8 @@ class Tool(Generic[ToolAgentDepsT]):
     This schema may be modified by the `prepare` function or by the Model class prior to including it in an API request.
     """
 
+    _function_signatures: _FunctionSignatureCache | None = field(default=None, init=False, repr=False, compare=False)
+
     def __init__(
         self,
         function: ToolFuncEither[ToolAgentDepsT, ToolParams],
@@ -439,6 +440,7 @@ class Tool(Generic[ToolAgentDepsT]):
         self.timeout = timeout
         self.defer_loading = defer_loading
         self.include_return_schema = include_return_schema
+        self._function_signatures = None
 
     @classmethod
     def from_schema(
@@ -500,18 +502,26 @@ class Tool(Generic[ToolAgentDepsT]):
 
     @property
     def tool_def(self) -> ToolDefinition:
+        parameters_json_schema = self.function_schema.json_schema
+        return_schema = self.function_schema.return_schema
+        # Every definition this tool produces shares one signature cache, so the function
+        # signature is built once per tool rather than once per model request step.
+        signatures = self._function_signatures
+        if signatures is None or not signatures.covers(parameters_json_schema, return_schema):
+            signatures = self._function_signatures = _FunctionSignatureCache(parameters_json_schema, return_schema)
         return ToolDefinition(
             name=self.name,
             description=self.description,
-            parameters_json_schema=self.function_schema.json_schema,
+            parameters_json_schema=parameters_json_schema,
             strict=self.strict,
             sequential=self.sequential,
             metadata=self.metadata,
             timeout=self.timeout,
             defer_loading=self.defer_loading,
             kind='unapproved' if self.requires_approval else 'function',
-            return_schema=self.function_schema.return_schema,
+            return_schema=return_schema,
             include_return_schema=self.include_return_schema,
+            _function_signatures=signatures,
         )
 
     async def prepare_tool_def(self, ctx: RunContext[ToolAgentDepsT]) -> ToolDefinition | None:
@@ -544,6 +554,52 @@ With PEP-728 this should be a TypedDict with `type: Literal['object']`, and `ext
 
 ToolKind: TypeAlias = Literal['function', 'output', 'external', 'unapproved']
 """Kind of tool."""
+
+
+class _FunctionSignatureCache:
+    """Function signatures built from one pair of schema objects, keyed by tool name.
+
+    `ToolDefinition.function_signature` is derived from the definition's schemas and name, and
+    building it is the expensive part of rendering a tool as code. Definitions themselves are
+    short-lived: `Tool.tool_def` creates a fresh one on every read, and toolsets `replace()` them on
+    every model request step. A cache stored on the definition alone would die with it, so the
+    cache is an object the tool shares with every definition it produces and that `replace()`
+    carries along unchanged.
+
+    It is anchored to the schema *objects*, not their content: a definition whose schemas were
+    swapped by `replace()` (a model transforming the schema for the wire, a return schema cleared)
+    fails `covers()` and gets a cache of its own, so it never renders a signature for a schema it no
+    longer has. The name is part of the key because it seeds fallback type names and the dedup
+    prefix, so a renamed definition (`PrefixedToolset`, a sanitizing code-mode wrapper) gets its own
+    entry without evicting the original.
+    """
+
+    __slots__ = ('_parameters_json_schema', '_return_schema', '_signatures')
+
+    def __init__(self, parameters_json_schema: ObjectJsonSchema, return_schema: ObjectJsonSchema | None) -> None:
+        self._parameters_json_schema = parameters_json_schema
+        self._return_schema = return_schema
+        self._signatures: dict[str, FunctionSignature] = {}
+
+    def covers(self, parameters_json_schema: ObjectJsonSchema, return_schema: ObjectJsonSchema | None) -> bool:
+        """Whether this cache was built from exactly these schema objects."""
+        return parameters_json_schema is self._parameters_json_schema and return_schema is self._return_schema
+
+    def get(self, name: str) -> FunctionSignature:
+        signature = self._signatures.get(name)
+        if signature is None:
+            signature = self._signatures[name] = FunctionSignature.from_schema(
+                name=name,
+                parameters_schema=self._parameters_json_schema,
+                return_schema=self._return_schema,
+            )
+        return signature
+
+    @classmethod
+    def __get_pydantic_core_schema__(cls, source: Any, handler: Any) -> core_schema.CoreSchema:
+        # Pydantic sees the `InitVar` as an init parameter of `ToolDefinition` and needs a schema
+        # for it. Nothing serializes one, and a validated definition rebuilds its signature on demand.
+        return core_schema.any_schema()
 
 
 @dataclass(repr=False, kw_only=True)
@@ -720,19 +776,31 @@ class ToolDefinition:
     in [`RunContext.loaded_capability_ids`][pydantic_ai.tools.RunContext.loaded_capability_ids].
     """
 
-    @cached_property
+    _function_signatures: InitVar[_FunctionSignatureCache | None] = None
+    # An `InitVar` rather than a field: `dataclasses.replace()` copies it from the instance
+    # attribute `__post_init__` stores, while `fields()`, `asdict()`, `__eq__`, `repr()` and every
+    # serializer -- schema-less `pydantic_core.to_json()` included -- never see it, so it cannot
+    # bloat a serialized `ModelRequestParameters` again (#5083). Type checkers don't let an
+    # `InitVar` be read or assigned as an attribute, hence `getattr`/`setattr` below.
+
+    def __post_init__(self, _function_signatures: _FunctionSignatureCache | None) -> None:
+        setattr(self, '_function_signatures', _function_signatures)
+
+    @property
     def function_signature(self) -> FunctionSignature:
         """The function signature shape for this tool.
 
-        Lazily computed from `parameters_json_schema` and `return_schema` on first access.
-        Name and description are not stored on the signature — pass them at render time
+        Computed from `parameters_json_schema`, `return_schema` and `name` on first access, and
+        reused by every definition that shares the same schema objects: the ones `Tool.tool_def`
+        produces on later model request steps, and the copies `dataclasses.replace()` makes of
+        them. Name and description are not stored on the signature — pass them at render time
         via `sig.render(body, name=td.name, description=td.description)`.
         """
-        return FunctionSignature.from_schema(
-            name=self.name,
-            parameters_schema=self.parameters_json_schema,
-            return_schema=self.return_schema,
-        )
+        signatures = cast('_FunctionSignatureCache | None', getattr(self, '_function_signatures'))
+        if signatures is None or not signatures.covers(self.parameters_json_schema, self.return_schema):
+            signatures = _FunctionSignatureCache(self.parameters_json_schema, self.return_schema)
+            setattr(self, '_function_signatures', signatures)
+        return signatures.get(self.name)
 
     def render_signature(self, body: str, **kwargs: Any) -> str:
         """Render the function signature with this tool's name and description.
